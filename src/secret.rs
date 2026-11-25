@@ -14,8 +14,9 @@ pub struct Secret(String);
 
 impl Secret {
     /// Validates that the value cannot inject headers or break protocol lines.
-    pub fn new(value: String) -> Result<Self, ProofError> {
+    pub fn new(mut value: String) -> Result<Self, ProofError> {
         if value.chars().any(|c| c.is_control()) {
+            value.zeroize();
             return Err(ProofError::config("credential contains control characters"));
         }
         Ok(Self(value))
@@ -46,12 +47,14 @@ pub struct ProxyCredentials {
 
 impl ProxyCredentials {
     pub fn new(username: String, password: String) -> Result<Self, ProofError> {
+        let mut username = Zeroizing::new(username);
+        let mut password = Zeroizing::new(password);
         if username.contains(':') {
             return Err(ProofError::config("username must not contain ':'"));
         }
         Ok(Self {
-            username: Secret::new(username)?,
-            password: Secret::new(password)?,
+            username: Secret::new(std::mem::take(&mut *username))?,
+            password: Secret::new(std::mem::take(&mut *password))?,
         })
     }
 

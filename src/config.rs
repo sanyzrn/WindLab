@@ -67,6 +67,9 @@ impl Target {
             .ok_or_else(|| ProofError::config("target URL has no host"))?;
         let host = normalize_host(raw_host)?;
         let port = parsed.port().unwrap_or(443);
+        if port == 0 {
+            return Err(ProofError::config("target port must be 1-65535"));
+        }
         let mut path_and_query = parsed.path().to_string();
         if path_and_query.is_empty() {
             path_and_query.push('/');

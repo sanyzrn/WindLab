@@ -77,9 +77,18 @@ where
 
     validate_content_encoding(&headers)?;
 
-    let body_bytes = if is_chunked(&headers)? {
+    let chunked = is_chunked(&headers)?;
+    let length = parse_content_length(&headers)?;
+    if chunked && length.is_some() {
+        return Err(ProofError::new(
+            FailureClass::DestinationHttp,
+            "http",
+            "conflicting Transfer-Encoding and Content-Length",
+        ));
+    }
+    let body_bytes = if chunked {
         read_chunked_body(stream, leftover).await?
-    } else if let Some(len) = parse_content_length(&headers)? {
+    } else if let Some(len) = length {
         read_exact_body(stream, leftover, len).await?
     } else {
         read_eof_body(stream, leftover).await?
@@ -261,7 +270,29 @@ async fn read_chunked_body<S: AsyncRead + Unpin>(
         pos = line_end + 2;
 
         if chunk_len == 0 {
-            return Ok(decoded);
+            // Consume the complete bounded trailer section before reporting success.
+            let trailer_start = pos;
+            loop {
+                let end = read_until_crlf(stream, &mut raw, pos).await?;
+                if end.saturating_sub(trailer_start) > 16 * 1024 {
+                    return Err(ProofError::new(
+                        FailureClass::DestinationHttp,
+                        "http",
+                        "chunk trailers exceed limit",
+                    ));
+                }
+                if end == pos {
+                    return Ok(decoded);
+                }
+                if !raw[pos..end].contains(&b':') {
+                    return Err(ProofError::new(
+                        FailureClass::DestinationHttp,
+                        "http",
+                        "malformed chunk trailer",
+                    ));
+                }
+                pos = end + 2;
+            }
         }
         if decoded.len().saturating_add(chunk_len) > MAX_BODY_BYTES {
             return Err(ProofError::new(
@@ -281,6 +312,11 @@ async fn read_chunked_body<S: AsyncRead + Unpin>(
         }
         decoded.extend_from_slice(&raw[pos..pos + chunk_len]);
         pos += chunk_len + 2;
+        // Discard consumed framing so many small chunks cannot grow memory unboundedly.
+        if pos >= 4096 {
+            raw.drain(..pos);
+            pos = 0;
+        }
     }
 }
 
@@ -292,7 +328,14 @@ async fn read_until_crlf<S: AsyncRead + Unpin>(
     let mut tmp = [0u8; 512];
     loop {
         if let Some(rel) = buf[start..].windows(2).position(|w| w == b"\r\n") {
-            return Ok(start + rel);
+            if rel <= 1024 {
+                return Ok(start + rel);
+            }
+            return Err(ProofError::new(
+                FailureClass::DestinationHttp,
+                "http",
+                "chunk size line exceeds limit",
+            ));
         }
         if buf.len().saturating_sub(start) > 1024 {
             return Err(ProofError::new(
@@ -344,4 +387,21 @@ async fn ensure_buffered<S: AsyncRead + Unpin>(
         buf.extend_from_slice(&tmp[..n]);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn chunked_requires_complete_trailers() {
+        let mut empty = tokio::io::empty();
+        assert!(read_chunked_body(&mut empty, b"1\r\na\r\n0\r\n".to_vec())
+            .await
+            .is_err());
+        let result = read_chunked_body(&mut empty, b"1\r\na\r\n0\r\nX-Test: ok\r\n\r\n".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(result, b"a");
+    }
 }

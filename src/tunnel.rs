@@ -240,6 +240,13 @@ pub async fn read_response_for<S: AsyncRead + Unpin>(
             buf.extend_from_slice(&chunk[..n]);
         };
 
+        if head_end + 4 > MAX_RESPONSE_HEADER_BYTES {
+            return Err(ProofError::new(
+                class,
+                stage,
+                "HTTP response head exceeds 16 KiB",
+            ));
+        }
         let mut headers = [httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
         let mut resp = httparse::Response::new(&mut headers);
         let parsed = resp
@@ -450,7 +457,8 @@ where
                         return Ok(ConnectOutcome::RetryOnFreshConnection);
                     }
                 }
-                Ok(_) => {
+                Ok(None) => return Ok(ConnectOutcome::RetryOnFreshConnection),
+                Ok(Some(_)) => {
                     if !leftover.is_empty() {
                         return Ok(ConnectOutcome::RetryOnFreshConnection);
                     }
