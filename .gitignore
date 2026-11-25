@@ -21,5 +21,7 @@ configs/private/
 node_modules/
 dist/
 target/
+Cargo.lock.bak
+.browser-screenshots/
 .DS_Store
 Thumbs.db
