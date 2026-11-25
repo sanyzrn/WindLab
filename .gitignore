@@ -1,0 +1,25 @@
+# Secrets / local files
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.pfx
+*.p12
+*.log
+*.exe
+*.msi
+*.apk
+*.deb
+*.zip
+local/
+research-local/
+secrets/
+runtime/
+configs/private/
+# Build artifacts
+node_modules/
+dist/
+target/
+.DS_Store
+Thumbs.db

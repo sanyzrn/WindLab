@@ -1,0 +1,9 @@
+# Agent instructions
+
+Read all docs before implementing. Start with phase 0/1 only; don't build the UI first. Work on a dedicated `feature/windscribe-proof` branch. Inspect current HEAD, preserve unrelated user changes, make small reversible commits. Use upstream documentation and source pinned to commits or release tags. Keep evidence separate from hypotheses; never invent an API or claim a test ran when it did not.
+
+Use only authorized account access and permitted service interfaces. Never read browser cookies, session tokens, passwords, or credential databases, modify the active Chrome extension, bypass authentication/2FA, impersonate a third-party client to defeat access controls, or use Speedo's API credentials or service. Owner supplies approved proxy credentials or completes provider-approved sign-in locally; never ask for secrets in chat or logs. If no supported route exists, document the blocker and test a local fixture rather than guessing.
+
+Do not execute the supplied installers or extracted binaries for research. Analyze locally supplied files statically, record hashes and paths, and do not commit them or proprietary decompiled material. Implement independently. Get explicit owner approval before any test changes OS routing, DNS, firewall, system proxy, certificate store, or active VPN state; no automatic interference with the active connection. Do not install a root CA. Do not silently fall back to direct traffic. Never commit secrets or generated sensitive configs.
+
+Before push: run relevant tests, document actual results and blockers, inspect staged diff for secrets, commit and push the dedicated branch. Open a draft PR, do not merge automatically. Do not tag or publish binaries. Keep dependencies pinned and use CI that requires no real credentials. Keep the implementation focused and avoid premature abstractions.
