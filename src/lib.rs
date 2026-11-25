@@ -11,12 +11,12 @@ pub mod secret;
 pub mod tunnel;
 pub mod verify;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use rustls::RootCertStore;
 
-use config::ProofConfig;
+use config::{AuthMode, ProofConfig, ProofOptions};
 use error::{FailureClass, ProofError};
 use secret::ProxyCredentials;
 
@@ -29,20 +29,34 @@ pub struct StageTiming {
 #[derive(Debug, Clone)]
 pub struct ProofReport {
     pub proxy_authority: String,
+    pub proxy_addr: SocketAddr,
     pub target_authority: String,
     pub exit_ip: IpAddr,
+    pub auth_reconnected: bool,
     pub stages: Vec<StageTiming>,
     pub total: Duration,
 }
 
-/// Runs the proof against the configured proxy. `roots` is the trust store
-/// used for both TLS legs; production callers pass public WebPKI roots,
-/// tests pass a fixture-only CA. There is no direct fallback: any failure
-/// aborts with a classified error.
+/// Runs the proof against the configured proxy using default options
+/// (challenge-response Basic auth). `roots` is the trust store used for both
+/// TLS legs; production callers pass public WebPKI roots, tests pass a
+/// fixture-only CA. There is no direct fallback: any failure aborts with a
+/// classified error.
 pub async fn run_proof(
     config: &ProofConfig,
     credentials: Option<&ProxyCredentials>,
     roots: RootCertStore,
+) -> Result<ProofReport, ProofError> {
+    run_proof_with_options(config, credentials, roots, ProofOptions::default()).await
+}
+
+/// Runs the proof with explicit [`ProofOptions`] (for example opt-in
+/// preemptive Basic auth).
+pub async fn run_proof_with_options(
+    config: &ProofConfig,
+    credentials: Option<&ProxyCredentials>,
+    roots: RootCertStore,
+    options: ProofOptions,
 ) -> Result<ProofReport, ProofError> {
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + config.timeout;
@@ -57,13 +71,14 @@ pub async fn run_proof(
     )
     .await?;
     let tcp = step(deadline, "tcp", tunnel::tcp_connect(&addrs), &mut stages).await?;
+    let proxy_addr = tcp.peer_addr().unwrap_or(addrs[0]);
     let proxy_name = tunnel::server_name(&config.proxy.host)?;
     let proxy_tls = step(
         deadline,
         "proxy-tls",
         tunnel::tls_connect(
             tcp,
-            proxy_name,
+            proxy_name.clone(),
             tls_config.clone(),
             "proxy-tls",
             FailureClass::ProxyTls,
@@ -71,13 +86,80 @@ pub async fn run_proof(
         &mut stages,
     )
     .await?;
-    let tunnel_stream = step(
-        deadline,
-        "connect",
-        tunnel::establish_connect(proxy_tls, &config.target.authority(), credentials),
-        &mut stages,
-    )
-    .await?;
+
+    let connect_authority = config.target.connect_authority();
+    let mut auth_reconnected = false;
+
+    let tunnel_stream = match (options.auth_mode, credentials) {
+        (AuthMode::Preemptive, Some(creds)) => {
+            step(
+                deadline,
+                "connect",
+                tunnel::establish_connect_authenticated(proxy_tls, &connect_authority, creds),
+                &mut stages,
+            )
+            .await?
+        }
+        _ => {
+            let outcome = step(
+                deadline,
+                "connect",
+                tunnel::establish_connect_with_reconnect(
+                    proxy_tls,
+                    &connect_authority,
+                    credentials,
+                ),
+                &mut stages,
+            )
+            .await?;
+
+            match outcome {
+                tunnel::ConnectOutcome::Established(stream) => stream,
+                tunnel::ConnectOutcome::RetryOnFreshConnection => {
+                    let creds = credentials.ok_or_else(|| {
+                        ProofError::new(
+                            FailureClass::ProxyAuth,
+                            "connect",
+                            "proxy requires authentication (407) but no credentials were provided",
+                        )
+                    })?;
+                    auth_reconnected = true;
+                    let retry_tcp = step(
+                        deadline,
+                        "tcp-retry",
+                        tunnel::tcp_connect(&[proxy_addr]),
+                        &mut stages,
+                    )
+                    .await?;
+                    let retry_tls = step(
+                        deadline,
+                        "proxy-tls-retry",
+                        tunnel::tls_connect(
+                            retry_tcp,
+                            proxy_name,
+                            tls_config.clone(),
+                            "proxy-tls-retry",
+                            FailureClass::ProxyTls,
+                        ),
+                        &mut stages,
+                    )
+                    .await?;
+                    step(
+                        deadline,
+                        "connect-retry",
+                        tunnel::establish_connect_authenticated(
+                            retry_tls,
+                            &connect_authority,
+                            creds,
+                        ),
+                        &mut stages,
+                    )
+                    .await?
+                }
+            }
+        }
+    };
+
     let mut dest_tls = step(
         deadline,
         "destination-tls",
@@ -95,8 +177,10 @@ pub async fn run_proof(
 
     Ok(ProofReport {
         proxy_authority: config.proxy.authority(),
+        proxy_addr,
         target_authority: config.target.authority(),
         exit_ip,
+        auth_reconnected,
         stages,
         total: started.elapsed(),
     })

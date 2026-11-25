@@ -5,7 +5,7 @@
 use std::fmt;
 
 use base64::Engine;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::ProofError;
 
@@ -55,14 +55,18 @@ impl ProxyCredentials {
         })
     }
 
-    /// HTTP Basic `Proxy-Authorization` header value. Built in memory only;
-    /// sent exclusively to the TLS-verified proxy, never to the destination.
-    pub fn basic_header_value(&self) -> String {
-        let raw = format!("{}:{}", self.username.expose(), self.password.expose());
-        format!(
-            "Basic {}",
-            base64::engine::general_purpose::STANDARD.encode(raw)
-        )
+    /// HTTP Basic `Proxy-Authorization` header value. Built in memory only,
+    /// zeroized on drop, and sent exclusively to the TLS-verified proxy,
+    /// never to the destination.
+    pub fn basic_header_value(&self) -> Zeroizing<String> {
+        let raw = Zeroizing::new(format!(
+            "{}:{}",
+            self.username.expose(),
+            self.password.expose()
+        ));
+        let encoded =
+            Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(raw.as_bytes()));
+        Zeroizing::new(format!("Basic {}", encoded.as_str()))
     }
 }
 

@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
-use windlab::config::{ProofConfig, ProxyEndpoint, Target};
+use windlab::config::{AuthMode, ProofConfig, ProofOptions, ProxyEndpoint, Target};
 use windlab::error::FailureClass;
 use windlab::secret::{ProxyCredentials, Secret};
 use windlab::tunnel;
@@ -145,10 +145,41 @@ async fn spawn_destination(tls: Arc<ServerConfig>, status: u16, body: &'static s
     addr
 }
 
+/// Destination HTTPS fixture with custom raw response bytes and optional
+/// keep-alive hold (to verify client does not hang waiting for EOF).
+async fn spawn_raw_destination(
+    tls: Arc<ServerConfig>,
+    raw_response: &'static [u8],
+    hold_open: bool,
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut tls = TlsAcceptor::from(tls).accept(stream).await.unwrap();
+        let _head = read_head(&mut tls).await;
+        tls.write_all(raw_response).await.unwrap();
+        tls.flush().await.unwrap();
+        if hold_open {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+        } else {
+            tls.shutdown().await.ok();
+        }
+    });
+    addr
+}
+
 #[derive(Clone)]
 enum ProxyBehavior {
     /// 407 challenge, then accepts only the exact expected Basic credentials.
     Challenge,
+    /// 407 challenge with an HTML body + `Connection: close`, then closes TLS
+    /// and expects the client to reconnect once with Basic credentials.
+    ChallengeCloseWithBody,
+    /// 407 challenge with a small `Content-Length` body on keep-alive.
+    ChallengeKeepAliveBody,
+    /// Requires Basic credentials on the very first CONNECT (preemptive mode).
+    PreemptiveOnly,
     NoAuth,
     Always407,
     Forbidden,
@@ -165,66 +196,164 @@ async fn spawn_proxy(
 ) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let expected_auth = ProxyCredentials::new(TEST_USER.into(), TEST_PASS.into())
+        .unwrap()
+        .basic_header_value()
+        .to_ascii_lowercase();
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let mut tls = TlsAcceptor::from(tls).accept(stream).await.unwrap();
-        let head = read_head(&mut tls).await;
+        let mut tls_stream = TlsAcceptor::from(tls.clone()).accept(stream).await.unwrap();
+        let head = read_head(&mut tls_stream).await;
         match behavior {
             ProxyBehavior::Silent => {
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
             ProxyBehavior::CloseAfterRequest => {
-                drop(tls);
+                drop(tls_stream);
             }
             ProxyBehavior::Forbidden => {
-                tls.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                tls_stream
+                    .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                     .await
                     .unwrap();
             }
             ProxyBehavior::NoAuth => {
-                tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                tls_stream
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
                     .await
                     .unwrap();
                 let mut upstream = TcpStream::connect(dest).await.unwrap();
-                tokio::io::copy_bidirectional(&mut tls, &mut upstream)
+                tokio::io::copy_bidirectional(&mut tls_stream, &mut upstream)
                     .await
                     .ok();
             }
-            ProxyBehavior::Challenge | ProxyBehavior::Always407 => {
-                // The first CONNECT must not carry credentials preemptively.
+            ProxyBehavior::PreemptiveOnly => {
+                let got = header_value(&head, "proxy-authorization");
+                if got.as_deref() == Some(expected_auth.as_str()) {
+                    tls_stream
+                        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut upstream = TcpStream::connect(dest).await.unwrap();
+                    tokio::io::copy_bidirectional(&mut tls_stream, &mut upstream)
+                        .await
+                        .ok();
+                } else {
+                    tls_stream
+                        .write_all(b"HTTP/1.1 403 Preemptive auth required\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+            }
+            ProxyBehavior::ChallengeCloseWithBody => {
                 if header_value(&head, "proxy-authorization").is_some() {
-                    tls.write_all(b"HTTP/1.1 500 Preemptive auth rejected\r\n\r\n")
+                    tls_stream
+                        .write_all(b"HTTP/1.1 500 Preemptive auth rejected\r\n\r\n")
                         .await
                         .unwrap();
                     return;
                 }
-                tls.write_all(
-                    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"fixture\"\r\nContent-Length: 0\r\n\r\n",
-                )
-                .await
-                .unwrap();
-                let head2 = read_head(&mut tls).await;
-                let expected = ProxyCredentials::new(TEST_USER.into(), TEST_PASS.into())
-                    .unwrap()
-                    .basic_header_value()
-                    .to_ascii_lowercase();
+                let body = b"<html><body>407 Auth Required</body></html>";
+                let resp = format!(
+                    "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"fixture\"\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                tls_stream.write_all(resp.as_bytes()).await.unwrap();
+                tls_stream.write_all(body).await.unwrap();
+                tls_stream.shutdown().await.ok();
+                drop(tls_stream);
+
+                // Accept the single fresh TLS reconnect with credentials.
+                let (stream2, _) = listener.accept().await.unwrap();
+                let mut tls2 = TlsAcceptor::from(tls).accept(stream2).await.unwrap();
+                let head2 = read_head(&mut tls2).await;
                 let got = header_value(&head2, "proxy-authorization");
-                let ok = matches!(behavior, ProxyBehavior::Challenge)
-                    && got.as_deref() == Some(expected.as_str());
-                if ok {
-                    tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                if got.as_deref() == Some(expected_auth.as_str()) {
+                    tls2.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
                         .await
                         .unwrap();
                     let mut upstream = TcpStream::connect(dest).await.unwrap();
-                    tokio::io::copy_bidirectional(&mut tls, &mut upstream)
+                    tokio::io::copy_bidirectional(&mut tls2, &mut upstream)
                         .await
                         .ok();
                 } else {
-                    tls.write_all(
+                    tls2.write_all(
                         b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"fixture\"\r\nContent-Length: 0\r\n\r\n",
                     )
                     .await
                     .unwrap();
+                }
+            }
+            ProxyBehavior::ChallengeKeepAliveBody => {
+                if header_value(&head, "proxy-authorization").is_some() {
+                    tls_stream
+                        .write_all(b"HTTP/1.1 500 Preemptive auth rejected\r\n\r\n")
+                        .await
+                        .unwrap();
+                    return;
+                }
+                let body = b"auth required";
+                let resp = format!(
+                    "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"fixture\"\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                tls_stream.write_all(resp.as_bytes()).await.unwrap();
+                tls_stream.write_all(body).await.unwrap();
+                let head2 = read_head(&mut tls_stream).await;
+                let got = header_value(&head2, "proxy-authorization");
+                if got.as_deref() == Some(expected_auth.as_str()) {
+                    tls_stream
+                        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut upstream = TcpStream::connect(dest).await.unwrap();
+                    tokio::io::copy_bidirectional(&mut tls_stream, &mut upstream)
+                        .await
+                        .ok();
+                } else {
+                    tls_stream
+                        .write_all(
+                            b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"fixture\"\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            ProxyBehavior::Challenge | ProxyBehavior::Always407 => {
+                // The first CONNECT must not carry credentials preemptively.
+                if header_value(&head, "proxy-authorization").is_some() {
+                    tls_stream
+                        .write_all(b"HTTP/1.1 500 Preemptive auth rejected\r\n\r\n")
+                        .await
+                        .unwrap();
+                    return;
+                }
+                tls_stream
+                    .write_all(
+                        b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"fixture\"\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let head2 = read_head(&mut tls_stream).await;
+                let got = header_value(&head2, "proxy-authorization");
+                let ok = matches!(behavior, ProxyBehavior::Challenge)
+                    && got.as_deref() == Some(expected_auth.as_str());
+                if ok {
+                    tls_stream
+                        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut upstream = TcpStream::connect(dest).await.unwrap();
+                    tokio::io::copy_bidirectional(&mut tls_stream, &mut upstream)
+                        .await
+                        .ok();
+                } else {
+                    tls_stream
+                        .write_all(
+                            b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"fixture\"\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
                 }
             }
         }
@@ -282,6 +411,7 @@ async fn happy_path_with_challenge_auth() {
     .await
     .unwrap();
     assert_eq!(report.exit_ip, EXIT_IP.parse::<IpAddr>().unwrap());
+    assert!(!report.auth_reconnected);
     let names: Vec<&str> = report.stages.iter().map(|s| s.name).collect();
     assert_eq!(
         names,
@@ -303,6 +433,50 @@ async fn happy_path_without_auth() {
         &config(f.proxy_port, f.dest_port, Duration::from_secs(10)),
         None,
         f.roots,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.exit_ip, EXIT_IP.parse::<IpAddr>().unwrap());
+}
+
+#[tokio::test]
+async fn proxy_407_with_connection_close_and_body_reconnects_once() {
+    let f = happy_fixture(ProxyBehavior::ChallengeCloseWithBody).await;
+    let report = windlab::run_proof(
+        &config(f.proxy_port, f.dest_port, Duration::from_secs(10)),
+        Some(&creds()),
+        f.roots,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.exit_ip, EXIT_IP.parse::<IpAddr>().unwrap());
+    assert!(report.auth_reconnected);
+}
+
+#[tokio::test]
+async fn proxy_407_with_keepalive_body_drains_and_reuses_connection() {
+    let f = happy_fixture(ProxyBehavior::ChallengeKeepAliveBody).await;
+    let report = windlab::run_proof(
+        &config(f.proxy_port, f.dest_port, Duration::from_secs(10)),
+        Some(&creds()),
+        f.roots,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.exit_ip, EXIT_IP.parse::<IpAddr>().unwrap());
+    assert!(!report.auth_reconnected);
+}
+
+#[tokio::test]
+async fn preemptive_auth_mode_sends_credentials_on_first_connect() {
+    let f = happy_fixture(ProxyBehavior::PreemptiveOnly).await;
+    let report = windlab::run_proof_with_options(
+        &config(f.proxy_port, f.dest_port, Duration::from_secs(10)),
+        Some(&creds()),
+        f.roots,
+        ProofOptions {
+            auth_mode: AuthMode::Preemptive,
+        },
     )
     .await
     .unwrap();
@@ -468,7 +642,7 @@ async fn wrong_destination_hostname_fails() {
 }
 
 // ---------------------------------------------------------------------------
-// Protocol / lifecycle failures
+// Protocol / lifecycle failures & HTTP framing
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -519,6 +693,42 @@ async fn buffered_bytes_after_connect_response_are_preserved() {
     let mut buf = [0u8; 5];
     tunneled.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"EARLY");
+}
+
+#[tokio::test]
+async fn destination_chunked_transfer_encoding_is_decoded() {
+    let ca = make_ca("WindLab Fixture CA");
+    let (cert, key) = make_leaf(&ca, &["localhost"], &[IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+    let tls = server_config(cert, key);
+    let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n203.0\r\n6\r\n.113.7\r\n0\r\n\r\n";
+    let dest = spawn_raw_destination(tls.clone(), raw, true).await;
+    let proxy = spawn_proxy(tls, ProxyBehavior::NoAuth, dest).await;
+    let report = windlab::run_proof(
+        &config(proxy.port(), dest.port(), Duration::from_secs(5)),
+        None,
+        client_roots(&ca),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.exit_ip, EXIT_IP.parse::<IpAddr>().unwrap());
+}
+
+#[tokio::test]
+async fn destination_keepalive_with_content_length_does_not_hang() {
+    let ca = make_ca("WindLab Fixture CA");
+    let (cert, key) = make_leaf(&ca, &["localhost"], &[IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+    let tls = server_config(cert, key);
+    let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: keep-alive\r\n\r\n203.0.113.7";
+    let dest = spawn_raw_destination(tls.clone(), raw, true).await;
+    let proxy = spawn_proxy(tls, ProxyBehavior::NoAuth, dest).await;
+    let report = windlab::run_proof(
+        &config(proxy.port(), dest.port(), Duration::from_secs(5)),
+        None,
+        client_roots(&ca),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.exit_ip, EXIT_IP.parse::<IpAddr>().unwrap());
 }
 
 #[tokio::test]
@@ -590,6 +800,26 @@ fn malformed_hosts_and_ports_are_rejected() {
     assert!(ProxyEndpoint::new("ok.example".into(), 0).is_err());
     assert!(ProxyEndpoint::new("ok.example".into(), 443).is_ok());
     assert!(ProxyEndpoint::new("127.0.0.1".into(), 8443).is_ok());
+}
+
+#[test]
+fn ipv6_literal_authority_and_connect_target_formatting() {
+    let ep = ProxyEndpoint::new("2001:db8::1".into(), 443).unwrap();
+    assert_eq!(ep.host, "2001:db8::1");
+    assert_eq!(ep.authority(), "[2001:db8::1]:443");
+
+    let ep_bracketed = ProxyEndpoint::new("[::1]".into(), 9443).unwrap();
+    assert_eq!(ep_bracketed.host, "::1");
+    assert_eq!(ep_bracketed.authority(), "[::1]:9443");
+
+    let t = Target::parse("https://api.ipify.org/").unwrap();
+    assert_eq!(t.authority(), "api.ipify.org");
+    assert_eq!(t.connect_authority(), "api.ipify.org:443");
+
+    let t_v6 = Target::parse("https://[2001:db8::1]/").unwrap();
+    assert_eq!(t_v6.host, "2001:db8::1");
+    assert_eq!(t_v6.authority(), "[2001:db8::1]");
+    assert_eq!(t_v6.connect_authority(), "[2001:db8::1]:443");
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! Destination verification through the established tunnel: end-to-end TLS
-//! to the target, one HTTP GET, and strict IP validation of the body.
+//! to the target, one HTTP GET, RFC 9112 body framing (`Content-Length`,
+//! `Transfer-Encoding: chunked`, or EOF), and strict IP validation of the body.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use crate::config::Target;
 use crate::error::{FailureClass, ProofError};
 use crate::tunnel;
 
-const MAX_BODY_BYTES: u64 = 64 * 1024;
+const MAX_BODY_BYTES: usize = 64 * 1024;
 
 pub async fn destination_tls<S>(
     tunnel_stream: S,
@@ -34,7 +35,9 @@ where
 }
 
 /// Sends `GET` and expects a bare IP address body (e.g. api.ipify.org).
-/// Any non-200 status or non-IP body is an explicit failure, never success.
+/// Supports `Content-Length`, `Transfer-Encoding: chunked`, and close-delimited
+/// responses. Any non-200 status or non-IP body is an explicit failure, never
+/// success.
 pub async fn http_get_ip<S>(
     stream: &mut TlsStream<S>,
     target: &Target,
@@ -43,7 +46,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: windlab-proof/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: windlab-proof/0.1\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
         target.path_and_query,
         target.authority()
     );
@@ -54,37 +57,16 @@ where
             format!("write failed: {e}"),
         )
     })?;
-
-    let mut buf = Vec::new();
-    let mut limited = stream.take(MAX_BODY_BYTES + 1);
-    limited.read_to_end(&mut buf).await.map_err(|e| {
+    stream.flush().await.map_err(|e| {
         ProofError::new(
             FailureClass::DestinationHttp,
             "http",
-            format!("read failed: {e}"),
+            format!("flush failed: {e}"),
         )
     })?;
-    if buf.len() as u64 > MAX_BODY_BYTES {
-        return Err(ProofError::new(
-            FailureClass::DestinationHttp,
-            "http",
-            "response exceeds 64 KiB limit",
-        ));
-    }
 
-    let mut headers = [httparse::EMPTY_HEADER; 32];
-    let mut resp = httparse::Response::new(&mut headers);
-    let head_len = match resp.parse(&buf) {
-        Ok(httparse::Status::Complete(n)) => n,
-        _ => {
-            return Err(ProofError::new(
-                FailureClass::DestinationHttp,
-                "http",
-                "malformed or incomplete HTTP response",
-            ))
-        }
-    };
-    let status = resp.code.unwrap_or(0);
+    let (status, headers, leftover) =
+        tunnel::read_response_for(stream, "http", FailureClass::DestinationHttp).await?;
     if status != 200 {
         return Err(ProofError::new(
             FailureClass::DestinationHttp,
@@ -92,7 +74,18 @@ where
             format!("destination returned status {status}"),
         ));
     }
-    let body = String::from_utf8_lossy(&buf[head_len..]);
+
+    validate_content_encoding(&headers)?;
+
+    let body_bytes = if is_chunked(&headers)? {
+        read_chunked_body(stream, leftover).await?
+    } else if let Some(len) = parse_content_length(&headers)? {
+        read_exact_body(stream, leftover, len).await?
+    } else {
+        read_eof_body(stream, leftover).await?
+    };
+
+    let body = String::from_utf8_lossy(&body_bytes);
     let body = body.trim();
     body.parse::<IpAddr>().map_err(|_| {
         ProofError::new(
@@ -101,4 +94,254 @@ where
             "destination body is not a bare IP address",
         )
     })
+}
+
+fn validate_content_encoding(headers: &[(String, String)]) -> Result<(), ProofError> {
+    for (name, value) in headers {
+        if name == "content-encoding" {
+            let enc = value.trim();
+            if !enc.is_empty() && !enc.eq_ignore_ascii_case("identity") {
+                return Err(ProofError::new(
+                    FailureClass::DestinationHttp,
+                    "http",
+                    format!("unsupported Content-Encoding: {enc}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_chunked(headers: &[(String, String)]) -> Result<bool, ProofError> {
+    let mut encodings = Vec::new();
+    for (name, value) in headers {
+        if name == "transfer-encoding" {
+            for part in value.split(',') {
+                let tok = part.trim().to_ascii_lowercase();
+                if !tok.is_empty() {
+                    encodings.push(tok);
+                }
+            }
+        }
+    }
+    if encodings.is_empty() {
+        return Ok(false);
+    }
+    if encodings.len() == 1 && encodings[0] == "chunked" {
+        return Ok(true);
+    }
+    Err(ProofError::new(
+        FailureClass::DestinationHttp,
+        "http",
+        "unsupported Transfer-Encoding",
+    ))
+}
+
+fn parse_content_length(headers: &[(String, String)]) -> Result<Option<usize>, ProofError> {
+    let mut out: Option<usize> = None;
+    for (name, value) in headers {
+        if name == "content-length" {
+            for part in value.split(',') {
+                let parsed = part.trim().parse::<usize>().map_err(|_| {
+                    ProofError::new(
+                        FailureClass::DestinationHttp,
+                        "http",
+                        "invalid Content-Length header",
+                    )
+                })?;
+                match out {
+                    Some(prev) if prev != parsed => {
+                        return Err(ProofError::new(
+                            FailureClass::DestinationHttp,
+                            "http",
+                            "conflicting Content-Length headers",
+                        ));
+                    }
+                    None => out = Some(parsed),
+                    _ => {}
+                }
+            }
+        }
+    }
+    if matches!(out, Some(len) if len > MAX_BODY_BYTES) {
+        return Err(ProofError::new(
+            FailureClass::DestinationHttp,
+            "http",
+            "response exceeds 64 KiB limit",
+        ));
+    }
+    Ok(out)
+}
+
+async fn read_exact_body<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    mut buf: Vec<u8>,
+    expected_len: usize,
+) -> Result<Vec<u8>, ProofError> {
+    if buf.len() >= expected_len {
+        buf.truncate(expected_len);
+        return Ok(buf);
+    }
+    let mut chunk = [0u8; 1024];
+    while buf.len() < expected_len {
+        let need = (expected_len - buf.len()).min(chunk.len());
+        let n = stream.read(&mut chunk[..need]).await.map_err(|e| {
+            ProofError::new(
+                FailureClass::DestinationHttp,
+                "http",
+                format!("read failed: {e}"),
+            )
+        })?;
+        if n == 0 {
+            return Err(ProofError::new(
+                FailureClass::DestinationHttp,
+                "http",
+                "destination closed connection before Content-Length bytes arrived",
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(buf)
+}
+
+async fn read_eof_body<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    mut buf: Vec<u8>,
+) -> Result<Vec<u8>, ProofError> {
+    if buf.len() > MAX_BODY_BYTES {
+        return Err(ProofError::new(
+            FailureClass::DestinationHttp,
+            "http",
+            "response exceeds 64 KiB limit",
+        ));
+    }
+    let remaining = (MAX_BODY_BYTES - buf.len()) as u64 + 1;
+    let mut limited = stream.take(remaining);
+    limited.read_to_end(&mut buf).await.map_err(|e| {
+        ProofError::new(
+            FailureClass::DestinationHttp,
+            "http",
+            format!("read failed: {e}"),
+        )
+    })?;
+    if buf.len() > MAX_BODY_BYTES {
+        return Err(ProofError::new(
+            FailureClass::DestinationHttp,
+            "http",
+            "response exceeds 64 KiB limit",
+        ));
+    }
+    Ok(buf)
+}
+
+async fn read_chunked_body<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    mut raw: Vec<u8>,
+) -> Result<Vec<u8>, ProofError> {
+    let mut decoded = Vec::new();
+    let mut pos = 0usize;
+
+    loop {
+        let line_end = read_until_crlf(stream, &mut raw, pos).await?;
+        let line = std::str::from_utf8(&raw[pos..line_end]).map_err(|_| {
+            ProofError::new(
+                FailureClass::DestinationHttp,
+                "http",
+                "invalid UTF-8 in chunk size line",
+            )
+        })?;
+        let size_hex = line.split(';').next().unwrap_or("").trim();
+        let chunk_len = usize::from_str_radix(size_hex, 16).map_err(|_| {
+            ProofError::new(
+                FailureClass::DestinationHttp,
+                "http",
+                "invalid chunk size",
+            )
+        })?;
+        pos = line_end + 2;
+
+        if chunk_len == 0 {
+            return Ok(decoded);
+        }
+        if decoded.len().saturating_add(chunk_len) > MAX_BODY_BYTES {
+            return Err(ProofError::new(
+                FailureClass::DestinationHttp,
+                "http",
+                "response exceeds 64 KiB limit",
+            ));
+        }
+
+        ensure_buffered(stream, &mut raw, pos + chunk_len + 2).await?;
+        if &raw[pos + chunk_len..pos + chunk_len + 2] != b"\r\n" {
+            return Err(ProofError::new(
+                FailureClass::DestinationHttp,
+                "http",
+                "malformed chunk terminator",
+            ));
+        }
+        decoded.extend_from_slice(&raw[pos..pos + chunk_len]);
+        pos += chunk_len + 2;
+    }
+}
+
+async fn read_until_crlf<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    start: usize,
+) -> Result<usize, ProofError> {
+    let mut tmp = [0u8; 512];
+    loop {
+        if let Some(rel) = buf[start..].windows(2).position(|w| w == b"\r\n") {
+            return Ok(start + rel);
+        }
+        if buf.len().saturating_sub(start) > 1024 {
+            return Err(ProofError::new(
+                FailureClass::DestinationHttp,
+                "http",
+                "chunk size line exceeds limit",
+            ));
+        }
+        let n = stream.read(&mut tmp).await.map_err(|e| {
+            ProofError::new(
+                FailureClass::DestinationHttp,
+                "http",
+                format!("read failed: {e}"),
+            )
+        })?;
+        if n == 0 {
+            return Err(ProofError::new(
+                FailureClass::DestinationHttp,
+                "http",
+                "unexpected EOF in chunked response",
+            ));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+async fn ensure_buffered<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    target_len: usize,
+) -> Result<(), ProofError> {
+    let mut tmp = [0u8; 1024];
+    while buf.len() < target_len {
+        let need = (target_len - buf.len()).min(tmp.len());
+        let n = stream.read(&mut tmp[..need]).await.map_err(|e| {
+            ProofError::new(
+                FailureClass::DestinationHttp,
+                "http",
+                format!("read failed: {e}"),
+            )
+        })?;
+        if n == 0 {
+            return Err(ProofError::new(
+                FailureClass::DestinationHttp,
+                "http",
+                "unexpected EOF in chunked body",
+            ));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    Ok(())
 }

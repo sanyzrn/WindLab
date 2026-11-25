@@ -8,11 +8,29 @@ use std::io::{BufRead, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rustls::RootCertStore;
-use windlab::config::{ProofConfig, ProxyEndpoint, Target};
+use windlab::config::{AuthMode, ProofConfig, ProofOptions, ProxyEndpoint, Target};
 use windlab::error::{FailureClass, ProofError};
 use windlab::secret::ProxyCredentials;
+use zeroize::Zeroize;
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliAuthMode {
+    /// Send credentials only after a 407 Basic challenge (default).
+    Challenge,
+    /// Send Basic credentials on the first CONNECT after proxy TLS verification.
+    Preemptive,
+}
+
+impl From<CliAuthMode> for AuthMode {
+    fn from(mode: CliAuthMode) -> Self {
+        match mode {
+            CliAuthMode::Challenge => Self::Challenge,
+            CliAuthMode::Preemptive => Self::Preemptive,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -36,15 +54,34 @@ struct Args {
     /// Overall deadline in seconds.
     #[arg(long, default_value_t = 30)]
     timeout_secs: u64,
+
+    /// Proxy authentication mode.
+    #[arg(long, value_enum, default_value_t = CliAuthMode::Challenge)]
+    auth_mode: CliAuthMode,
+
+    /// Emit machine-readable JSON diagnostics (never includes credentials).
+    #[arg(long)]
+    json: bool,
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    let json = args.json;
     match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("[fail] {err}");
-            eprintln!("exit-code: {}", err.class.exit_code());
+            if json {
+                println!(
+                    "{{\"ok\":false,\"class\":\"{}\",\"stage\":\"{}\",\"detail\":\"{}\",\"exit_code\":{}}}",
+                    err.class.as_str(),
+                    err.stage,
+                    json_escape(&err.detail),
+                    err.class.exit_code()
+                );
+            } else {
+                eprintln!("[fail] {err}");
+                eprintln!("exit-code: {}", err.class.exit_code());
+            }
             ExitCode::from(err.class.exit_code() as u8)
         }
     }
@@ -61,6 +98,10 @@ fn run(args: Args) -> Result<(), ProofError> {
         target,
         timeout: Duration::from_secs(args.timeout_secs),
     };
+    let options = ProofOptions {
+        auth_mode: args.auth_mode.into(),
+    };
+    let json = args.json;
 
     let credentials = prompt_credentials()?;
 
@@ -74,17 +115,32 @@ fn run(args: Args) -> Result<(), ProofError> {
 
     runtime.block_on(async {
         tokio::select! {
-            result = windlab::run_proof(&config, credentials.as_ref(), roots) => {
+            result = windlab::run_proof_with_options(
+                &config,
+                credentials.as_ref(),
+                roots,
+                options,
+            ) => {
                 match result {
                     Ok(report) => {
-                        for stage in &report.stages {
-                            println!("[ok] {} {}ms", stage.name, stage.elapsed.as_millis());
+                        if json {
+                            print_json_report(&report);
+                        } else {
+                            for stage in &report.stages {
+                                println!("[ok] {} {}ms", stage.name, stage.elapsed.as_millis());
+                            }
+                            println!(
+                                "proxy: {} [{}] (TLS verified)",
+                                report.proxy_authority, report.proxy_addr
+                            );
+                            println!("target: {} (TLS verified)", report.target_authority);
+                            println!("exit-ip: {}", report.exit_ip);
+                            if report.auth_reconnected {
+                                println!("auth-retry: reconnected fresh TLS session after 407");
+                            }
+                            println!("total: {}ms", report.total.as_millis());
+                            println!("note: proxy-only proof; no system routing, DNS, or UDP claim");
                         }
-                        println!("proxy: {} (TLS verified)", report.proxy_authority);
-                        println!("target: {} (TLS verified)", report.target_authority);
-                        println!("exit-ip: {}", report.exit_ip);
-                        println!("total: {}ms", report.total.as_millis());
-                        println!("note: proxy-only proof; no system routing, DNS, or UDP claim");
                         Ok(())
                     }
                     Err(err) => Err(err),
@@ -97,17 +153,52 @@ fn run(args: Args) -> Result<(), ProofError> {
     })
 }
 
+fn print_json_report(report: &windlab::ProofReport) {
+    let stages: Vec<String> = report
+        .stages
+        .iter()
+        .map(|s| format!("{{\"name\":\"{}\",\"ms\":{}}}", s.name, s.elapsed.as_millis()))
+        .collect();
+    println!(
+        "{{\"ok\":true,\"proxy\":\"{}\",\"proxy_addr\":\"{}\",\"target\":\"{}\",\"exit_ip\":\"{}\",\"auth_reconnected\":{},\"total_ms\":{},\"stages\":[{}]}}",
+        json_escape(&report.proxy_authority),
+        report.proxy_addr,
+        json_escape(&report.target_authority),
+        report.exit_ip,
+        report.auth_reconnected,
+        report.total.as_millis(),
+        stages.join(",")
+    );
+}
+
+fn json_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Username via plain line input; password via no-echo prompt. Empty username
 /// means the proxy is expected to require no authentication.
 fn prompt_credentials() -> Result<Option<ProxyCredentials>, ProofError> {
     eprint!("Proxy username (empty = no auth): ");
     std::io::stderr().flush().ok();
-    let mut username = String::new();
+    let mut raw_username = String::new();
     std::io::stdin()
         .lock()
-        .read_line(&mut username)
+        .read_line(&mut raw_username)
         .map_err(|e| ProofError::config(format!("cannot read username: {e}")))?;
-    let username = username.trim().to_string();
+    let username = raw_username.trim().to_string();
+    raw_username.zeroize();
     if username.is_empty() {
         return Ok(None);
     }
