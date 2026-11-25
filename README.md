@@ -1,6 +1,8 @@
 # WindLab
 
-Independent personal Windows VPN client, prioritizing reliable connectivity on Iranian networks using the owner's authorized Windscribe account. This repository is a documentation-first bootstrap, not a working VPN yet.
+Independent personal Windows VPN client, prioritizing reliable connectivity on Iranian networks using the owner's authorized Windscribe account.
+
+Status (2026-11-25): phase-1 CLI proof implemented and fixture-verified (`windlab-proof`, 26 local tests). **Live Windscribe connectivity is not yet proven**: official sources document no non-browser HTTPS-proxy credential path (see [research](docs/03-RESEARCH.md) and [phase report](docs/08-PHASE1-REPORT.md)). No GUI, no TUN, no OS network changes.
 
 ## Start here
 - [AGENTS.md](AGENTS.md): mandatory engineering instructions
@@ -11,6 +13,7 @@ Independent personal Windows VPN client, prioritizing reliable connectivity on I
 - [Roadmap and acceptance](docs/05-ROADMAP.md)
 - [Windows test plan](docs/06-WINDOWS-TESTS.md)
 - [Dependencies and licensing](docs/07-LICENSES.md)
+- [Phase 0/1 report](docs/08-PHASE1-REPORT.md)
 - [Engineering handoff prompt](AGENT_PROMPT.md)
 
 First milestone: prove an independently authorized HTTPS proxy connection works with Speedo disconnected. No UI or global routing required for that milestone. Do not treat a successful connection to a proxy as evidence of a working full-device VPN.
